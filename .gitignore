@@ -1,0 +1,32 @@
+.env
+__pycache__/
+*.pyc
+.venv/
+venv/
+build/
+dist/
+.DS_Store
+*.log
+.pytest_cache/
+*.egg-info/
+.mypy_cache/
+.ruff_cache/
+.idea/
+.vscode/
+*.swp
+.coverage
+
+# Scans are of real people: no video, frames or models in git, ever.
+/runs/
+*.mp4
+*.mov
+*.m4v
+*.avi
+*.glb
+*.gltf
+*.ply
+*.obj
+*.3mf
+
+# downloaded by scripts/setup_windows.ps1
+/tools/
