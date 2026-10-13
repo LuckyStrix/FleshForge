@@ -31,6 +31,16 @@ The `.venv` is Python 3.12 (open3d has no 3.13+ wheels).
   (det +1), so winding survives; `scan` flips the faces if the signed volume is negative.
 - **"closed" means every edge has exactly two triangles.** Open3D's `is_watertight` also fails on
   self-intersection, which Poisson output often has.
+- **Closing the mesh is a loop, after decimation** (`mesh.build`): drop triangles on edges with
+  four triangles, drop folded slivers (`drop_folded`: two triangles running an edge the same
+  way, which Open3D counts as fine), cap, repeat. `cap_holes` gives each rim loop its own centre;
+  one fan for two openings that touch at a vertex puts four triangles on one edge.
+- **The mapper splits a head orbit** at the back-of-head frames when the wall behind is plain.
+  `cm.best_model` merges models that share frames (`model_merger`, then `bundle_adjuster`); on
+  the first real scan that took 122 placed frames to 150 of 160.
+- **Smoothing is sized from the camera distance**, the only yardstick in a scan with no scale:
+  `SMOOTH_VOXEL` x distance x `--smooth` is the point spacing, and each point moves onto the
+  plane through its 48 neighbours. Colours still come from the unsmoothed cloud.
 
 ## Bite
 
@@ -42,6 +52,7 @@ The `.venv` is Python 3.12 (open3d has no 3.13+ wheels).
   warning.
 - **Smooth noise gives COLMAP nothing to match** (about 90 SIFT features a frame); the synthetic
   scene uses hard-edged cells for that reason.
-- **Unverified on a real head:** person masks inside the pipeline, the front-of-face direction
-  (checked on one portrait photo only), timing at full size, and any print.
+- **One real head scanned** (720p compressed video): masks and front detection worked. Still
+  unverified: a sharp original video, the `stackforge-paint` handoff of a real head, any print.
+- **Commits here carry no Claude co-author line** (the user asked to be the listed contributor).
 - `tools/` (COLMAP) and `runs/` are gitignored; `scripts/setup_windows.ps1` recreates `tools/`.

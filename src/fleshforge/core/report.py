@@ -24,7 +24,8 @@ def check_sparse(frames: int, registered: int, models: int) -> tuple[list, list]
             f"{MIN_REGISTERED:.0%}). Usual causes: motion blur, the subject moving, or a plain "
             "background with nothing to track")
     if models > 1:
-        warnings.append(f"the frames fell into {models} separate reconstructions; the largest is used")
+        warnings.append(f"the frames fell into {models} separate reconstructions that could not be joined; "
+                        "the largest is used")
     return errors, warnings
 
 

@@ -169,6 +169,35 @@ def test_cap_holes_leaves_a_closed_mesh_alone():
     assert n == 0 and len(f) == 4
 
 
+def test_cap_holes_caps_two_openings_that_touch_at_a_vertex():
+    # an octahedron with two faces missing that share only the top vertex: one fan to a single
+    # centre would run four triangles through the edge from that vertex to the centre
+    v = np.array([[1, 0, 0], [0, 1, 0], [-1, 0, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]], dtype=float)
+    f = np.array([[0, 1, 4], [1, 2, 4], [2, 3, 4], [3, 0, 4], [1, 0, 5], [2, 1, 5], [3, 2, 5], [0, 3, 5]])
+    v2, f2, n = mesh.cap_holes(v, f[[1, 3, 4, 5, 6, 7]])
+    assert n == 2 and len(v2) == 8
+    assert edges_are_closed(f2)
+    edges = np.sort(np.concatenate([f2[:, [0, 1]], f2[:, [1, 2]], f2[:, [2, 0]]]), axis=1)
+    assert (np.unique(edges, axis=0, return_counts=True)[1] == 2).all()
+    assert report.signed_volume(v2, f2) > 0
+
+
+def test_drop_folded_removes_triangles_that_share_an_edge_direction():
+    flipped = np.vstack([TETRA_F[:3], TETRA_F[3:, ::-1]])   # last face wound the wrong way
+    kept = mesh.drop_folded(flipped, 4)
+    assert len(mesh.drop_folded(TETRA_F, 4)) == 4 and len(kept) == 0   # it clashes with all three
+
+
+def test_smooth_points_flattens_noise_on_a_plane():
+    rng = np.random.default_rng(0)
+    xy = np.stack(np.meshgrid(np.arange(40.0), np.arange(40.0)), axis=-1).reshape(-1, 2)
+    pts = np.column_stack([xy, rng.normal(0, 0.3, len(xy))])
+    out, normals = mesh.smooth_points(pts, k=24)
+    assert out[:, 2].std() < 0.3 * pts[:, 2].std()
+    assert np.abs(out[:, :2] - xy).max() < 0.5              # points slide along z, not sideways
+    assert np.median(np.abs(normals[:, 2])) > 0.99
+
+
 def test_crop_sphere_and_colour_from_cloud():
     pts = np.array([[0, 0, 0], [0.5, 0, 0], [2, 0, 0]], dtype=float)
     assert mesh.crop_sphere(pts, np.zeros(3), 1.0).tolist() == [True, True, False]
@@ -257,6 +286,43 @@ def test_run_reports_a_failing_command(tmp_path):
     with pytest.raises(cm.ColmapError) as err:
         fake.run("-c", ["import sys; print('went wrong'); sys.exit(3)"], tmp_path, log)
     assert "exit 0x3" in str(err.value) and "went wrong" in str(err.value)
+
+
+class FakeMerger:
+    """Stands in for COLMAP in merge_models: a model is the set of frame names in its folder."""
+    def __init__(self):
+        self.commands = []
+
+    def run(self, command, args, root, log, report=print):
+        self.commands.append(command)
+        named = dict(zip(args[::2], args[1::2]))
+        if command == "model_merger":
+            one, two = (set((named[k] / "names").read_text().split()) for k in ("--input_path1", "--input_path2"))
+            if not one & two:
+                raise cm.ColmapError("no shared frames")
+            (named["--output_path"] / "names").write_text(" ".join(sorted(one | two)))
+            (named["--output_path"] / "images.bin").write_bytes(b"")
+        elif command == "bundle_adjuster":
+            (named["--output_path"] / "names").write_text((named["--input_path"] / "names").read_text())
+
+
+def test_merge_models_joins_what_shares_frames(tmp_path, monkeypatch):
+    def model(name, frames):
+        folder = tmp_path / "sparse" / name
+        folder.mkdir(parents=True)
+        (folder / "names").write_text(" ".join(frames))
+        return cm.SparseModel(folder, list(frames), 0, 0.0)
+    monkeypatch.setattr(cm, "read_model", lambda colmap, root, folder, log: cm.SparseModel(
+        folder, (folder / "names").read_text().split(), 0, 0.0))
+    fake = FakeMerger()
+    models = [model("0", "abcd"), model("1", "cdef"), model("2", "xy")]
+    best, left_out = cm.merge_models(fake, tmp_path, models, tmp_path / "merged", tmp_path / "log")
+    assert sorted(best.poses) == list("abcdef") and left_out == 1
+    assert fake.commands == ["model_merger", "model_merger", "bundle_adjuster"]
+
+    fake = FakeMerger()                                     # nothing joins: the largest, untouched
+    best, left_out = cm.merge_models(fake, tmp_path, [models[0], models[2]], tmp_path / "m2", tmp_path / "log")
+    assert best is models[0] and left_out == 1 and "bundle_adjuster" not in fake.commands
 
 
 def test_stereo_clears_stale_depth_maps(tmp_path):

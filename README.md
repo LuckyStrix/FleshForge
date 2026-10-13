@@ -14,9 +14,13 @@ automatic choice of filaments are not.
 
 ## Caveats up front
 
-- **Not yet run on a real head.** The whole pipeline is tested on a synthetic scene (a textured
-  ball, ray-traced) and its GLB loads in `stackforge-paint`. The person masks and the
-  front-of-face detection have not been through a real scan, and nothing has been printed.
+- **Run on one real head, never printed.** One 36 s phone video (720p, a compressed copy) gave
+  a recognisable, closed, correctly oriented head and shoulders, with the person masks and the
+  front-of-face detection working. The automated tests use a synthetic scene (a textured ball,
+  ray-traced). Nothing has been through `stackforge-paint` to a printer yet.
+- **Skin comes out pebbled unless it is smoothed, and smoothing eats the face.** Depth noise on
+  skin is bumps about as big as an eyelid. `--smooth` (default 1.5) trades one for the other;
+  a sharper video is the real fix.
 - **Expect shape plus a few flat colours, not a photograph.** A four-toolhead printer gets four
   filaments, and `stackforge-paint` gives each voxel its nearest one.
 - **The mesh invents what the camera did not see.** Under the chin, the top of the head and the
@@ -55,6 +59,9 @@ Scans are of real people, so `runs/` and every video and model format are in `.g
 - Keep the room in view. The background is what the camera positions are solved from.
 - Hair tied back or under a cap gives a cleaner shape.
 - Lock exposure and focus if the phone allows it.
+- Use the phone's original file (cable or AirDrop). A copy sent through a messaging app is
+  shrunk and recompressed, and the lost skin texture is exactly what the depth step needs.
+- Nothing on the neck or head that is not meant to be printed: it becomes part of the model.
 
 A folder of photos works in place of a video: `fleshforge-scan photos/ -o runs/alex`.
 
@@ -66,14 +73,16 @@ Each stage keeps its output in the run folder, so a rerun continues where it sto
 | stage | what happens |
 |---|---|
 | `frames` | ffmpeg extracts three times the frames needed, and the sharpest in each time window is kept (120 by default) |
-| `sfm` | COLMAP finds features, matches every pair, and solves the camera positions |
+| `sfm` | COLMAP finds features, matches every pair, and solves the camera positions. If it splits the orbit into several reconstructions, the ones that share frames are merged |
 | `undistort` | frames are corrected for lens distortion and shrunk to `--dense-size` |
 | `masks` | the person is found in each frame (rembg, `u2net_human_seg`), so the room stays out of the cloud |
 | `stereo` | COLMAP computes a depth map per frame on the GPU (the slow part) |
 | `fuse` | depth maps are merged into one coloured point cloud |
-| `mesh` | crop to the subject, Poisson surface, cap openings, 300k triangles, colours from the cloud, orient (up from the phone, front from where a face was seen), write GLB, preview and report |
+| `mesh` | crop to the subject, flatten depth noise, Poisson surface, 300k triangles, cap openings, colours from the cloud, orient (up from the phone, front from where a face was seen), write GLB, preview and report |
 
 Useful options: `--dense fine` (COLMAP's full two-pass stereo, several times slower),
+`--smooth` (0 = mesh the raw cloud, 1 = light, 2 = smooth skin but soft eyes and mouth; with
+`--from mesh` a new value takes seconds to try),
 `--mask off` (scan an object, not a person), `--crop` (how far from the point the cameras look
 at is kept), `--colmap native|docker`.
 
@@ -99,8 +108,9 @@ docker pull colmap/colmap:latest      # or set FLESHFORGE_COLMAP_IMAGE to anothe
 `--colmap docker` runs every COLMAP step in the container.
 
 Timing on an RTX 5060 Ti, 40 frames at 800 px: poses 7 s, dense stereo 92 s with `--dense fast`
-and 7.5 min with `--dense fine` (both in Docker). A real scan (120 frames at 1200 px) has not
-been timed.
+and 7.5 min with `--dense fine` (both in Docker). The real scan (150 frames at 1280 px): poses
+under a minute, dense stereo 6 min with `--dense fast`; `--dense fine` was not timed. Dense
+stereo is also the step that needs the most memory.
 
 ## Development
 

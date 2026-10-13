@@ -37,6 +37,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="keep the cloud within this fraction of the camera distance from the "
                          "point the cameras look at (0 = no crop)")
     ap.add_argument("--poisson-depth", type=int, default=9, help="mesh detail; 10 is finer and noisier")
+    ap.add_argument("--smooth", type=float, default=1.5,
+                    help="how much depth noise is flattened before meshing: 0 = off, 2 = twice "
+                         "as far (loses fine detail)")
     ap.add_argument("--triangles", type=int, default=300_000, help="triangle budget of the GLB")
     ap.add_argument("--from", dest="from_stage", choices=STAGES,
                     help="redo this stage and everything after it")
@@ -164,7 +167,7 @@ def scan(args, report_line=print) -> dict:
     distance = float(np.linalg.norm(centres - centre, axis=1).mean())
     report_line("mesh: building the surface")
     m = mesh.build(run.fused, centre, args.crop * distance if args.crop > 0 else None,
-                   args.poisson_depth, args.triangles, report_line)
+                   args.poisson_depth, args.triangles, report_line, args.smooth, distance)
 
     faces = orient.detect_faces([run.frames / p.name for p in model.poses], report_line)
     front = orient.front_direction(model.poses, centre, up, faces)
@@ -185,7 +188,8 @@ def scan(args, report_line=print) -> dict:
     report.save_preview(run.dir / "preview.png", *mesh.sample_surface(vertices, tris, m.colors))
 
     stats = {
-        "input": str(src), "colmap": colmap.version(), "dense": args.dense, "frames": n_frames,
+        "input": str(src), "colmap": colmap.version(), "dense": args.dense, "smooth": args.smooth,
+        "frames": n_frames,
         "registered": len(model.poses), "models": n_models, "sparse_points": model.n_points,
         "reproj_error": round(model.reproj_error, 3),
         "arc_deg": round(orient.arc_degrees(centres, centre, up), 1),

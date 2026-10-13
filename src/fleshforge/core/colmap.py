@@ -316,12 +316,49 @@ def read_model(colmap: Colmap, root: Path, model_dir: Path, log: Path) -> Sparse
     return SparseModel(model_dir, poses, n, err)
 
 
+def merge_models(colmap: Colmap, root: Path, models: list, work: Path, log: Path) -> tuple[SparseModel, int]:
+    """Join the smaller models onto the largest where they share frames, then re-optimise.
+
+    Returns (model, how many models were left out). The mapper starts a new model when it cannot
+    carry on from the last frame (the back of a head against a plain wall is typical); the same
+    frames often sit in both, and that overlap is what `model_merger` aligns them by."""
+    models = sorted(models, key=lambda m: len(m.poses), reverse=True)
+    best, left_out = models[0], 0
+    for k, other in enumerate(models[1:]):
+        out = work / f"merge{k}"
+        if out.exists():
+            shutil.rmtree(out)
+        out.mkdir(parents=True)
+        try:
+            colmap.run("model_merger", ["--input_path1", best.folder, "--input_path2", other.folder,
+                                        "--output_path", out], root, log, report=lambda *_: None)
+            joined = read_model(colmap, root, out, log) if (out / "images.bin").exists() else None
+        except ColmapError:
+            joined = None
+        if joined and len(joined.poses) > len(best.poses):
+            best = joined
+        else:
+            left_out += 1
+    if best is not models[0]:
+        out = work / "adjusted"
+        if out.exists():
+            shutil.rmtree(out)
+        out.mkdir()
+        colmap.run("bundle_adjuster", ["--input_path", best.folder, "--output_path", out], root, log,
+                   report=lambda *_: None)
+        best = read_model(colmap, root, out, log)
+    return best, left_out
+
+
 def best_model(colmap: Colmap, root: Path, sparse_dir: Path, log: Path) -> tuple[SparseModel, int]:
-    """The model with the most registered images, and how many models the mapper made.
-    More than one means the frames did not all connect."""
+    """The model to use, and how many separate models it stands for (1 = everything connected).
+    When the mapper made several, the ones that share frames with the largest are merged into it."""
     folders = sorted(p for p in sparse_dir.iterdir() if p.is_dir() and not p.name.endswith("_txt"))
     if not folders:
         raise ColmapError("COLMAP could not build a model from these frames (too little overlap "
                           "or texture). Check the capture advice in the README and retake the video")
     models = [read_model(colmap, root, f, log) for f in folders]
-    return max(models, key=lambda m: len(m.poses)), len(models)
+    if len(models) == 1:
+        return models[0], 1
+    model, left_out = merge_models(colmap, root, models, sparse_dir.parent / "merged", log)
+    return model, 1 + left_out
