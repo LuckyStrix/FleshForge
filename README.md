@@ -73,11 +73,13 @@ Each stage keeps its output in the run folder, so a rerun continues where it sto
 after it, so a new video in an old folder never reuses the last person's frames. The input is
 recognised by its contents, so a moved or re-copied video counts as the same one; for a folder
 of photos only the images count, not sidecar files. `--from STAGE` redoes that stage and the
-ones after it regardless. A folder made before inputs were recorded keeps its finished stages.
+ones after it regardless. A folder made by an earlier version keeps its finished stages and
+camera solution. If a stage's files have been deleted (to free space, say), that stage is
+redone.
 
 `scan.log` in the run folder keeps, for every run, the settings used, each progress line with
 the time since the start, how long each stage took, and which stages were reused. A run that
-fails still logs how far it got. `report.json` also holds the settings and `stage_seconds`.
+fails still logs how far it got, why, and which stages it did not reach. `report.json` also holds the settings and `stage_seconds`.
 
 | stage | what happens |
 |---|---|

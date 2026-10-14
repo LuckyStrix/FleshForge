@@ -115,6 +115,7 @@ def test_an_old_run_folder_keeps_its_stages(tmp_path):
     args = scan.build_parser().parse_args([str(video), "-o", str(run.dir), "--dense", "fine"])
     assert run.match_inputs(scan.stage_inputs(args, video)) is None
     assert scan.Run(run.dir).done("stereo") and scan.Run(run.dir).state["inputs"]["stereo"] == {"dense": "fine"}
+    # (its model is then found on disk with cm.earlier_choice, tested in test_core)
 
 
 def test_a_redo_is_on_disk_before_its_files_go(tmp_path):
@@ -142,7 +143,52 @@ def test_scan_log_records_settings_and_stage_times(tmp_path):
     text = (tmp_path / "scan.log").read_text(encoding="utf-8")
     assert '"dense": "fine"' in text and "frames: kept 3" in text and shown == ["frames: kept 3"]
     assert "stage frames:" in text and "stage sfm: FAILED" in text and "mapper fell over" in text
-    assert "reused from an earlier run: sfm, undistort" in text and "frames" in log.timings
+    assert "frames" in log.timings
+    # nothing was reused, and the failed stage is listed once, as failed
+    assert "reused" not in text and "not run: undistort, masks, stereo, fuse, mesh" in text
+
+    log = scan.ScanLog(tmp_path / "again.log", shown.append)
+    log.reused = ["frames", "sfm"]
+    log.summary()
+    assert "reused from an earlier run: frames, sfm" in (tmp_path / "again.log").read_text(encoding="utf-8")
+
+
+def test_missing_stage_files_are_found(tmp_path):
+    run = scan.Run(tmp_path)
+    for stage in scan.STAGES[:-1]:
+        run.finish(stage)
+    for folder in (run.frames, run.colmap / "sparse", run.dense / "images", run.masks,
+                   run.dense / "stereo" / "depth_maps"):
+        folder.mkdir(parents=True)
+    run.fused.write_bytes(b"")
+    assert run.missing_output(use_masks=True) is None
+    shutil.rmtree(run.colmap)                                      # deleted to free space
+    assert run.missing_output(use_masks=True) == "sfm"
+
+
+def test_a_folder_from_the_previous_format_keeps_its_stages(tmp_path):
+    # 9f1826a stored the source as {path, bytes, modified}
+    video = tmp_path / "orbit.mp4"
+    video.write_bytes(b"orbit")
+    args = scan.build_parser().parse_args([str(video), "-o", str(tmp_path / "run")])
+    run = finished_run(tmp_path, args)
+    run.state["inputs"]["frames"]["source"] = {"path": str(video.resolve()), "bytes": 5, "modified": 1}
+    run.save()
+    assert scan.Run(run.dir).match_inputs(scan.stage_inputs(args, video)) is None
+    run.state["inputs"]["frames"]["source"] = {"path": str(video.resolve()), "bytes": 6, "modified": 1}
+    run.save()
+    assert scan.Run(run.dir).match_inputs(scan.stage_inputs(args, video)) == "frames"
+
+
+def test_unchanged_photos_are_not_read_again(tmp_path, monkeypatch):
+    photos = tmp_path / "photos"
+    photos.mkdir()
+    for name in ("a.jpg", "b.jpg"):
+        (photos / name).write_bytes(name.encode() * 100)
+    cache = {}
+    first = scan.source_identity(photos, cache)
+    monkeypatch.setattr(scan, "open", lambda *a, **k: pytest.fail("read a file it already knew"), raising=False)
+    assert scan.source_identity(photos, cache) == first
 
 
 def test_missing_input_is_reported(tmp_path):

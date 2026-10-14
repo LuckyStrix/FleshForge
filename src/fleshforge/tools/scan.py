@@ -106,6 +106,7 @@ class Run:
         made_with = self.state.get("inputs")
         changed = None
         if made_with is not None:
+            _migrate_source(made_with, inputs)
             for stage in STAGES:
                 if stage in inputs and made_with.get(stage) != inputs[stage]:
                     changed = stage
@@ -117,33 +118,69 @@ class Run:
         return changed
 
 
-def file_identity(path: Path) -> str:
+    def missing_output(self, use_masks: bool) -> str | None:
+        """The first done stage whose files are gone (deleted to free space, say), or None."""
+        made = {"frames": self.frames, "sfm": self.colmap / "sparse", "undistort": self.dense / "images",
+                "masks": self.masks if use_masks else None, "stereo": self.dense / "stereo" / "depth_maps",
+                "fuse": self.fused}
+        for stage in STAGES:
+            if self.done(stage) and made.get(stage) is not None and not made[stage].exists():
+                return stage
+        return None
+
+
+def _migrate_source(made_with: dict, inputs: dict) -> None:
+    """Folders from 9f1826a stored the source as {path, bytes, modified}. If that still names
+    a file of that size with today's identity, it is the same source: no hour of stereo again."""
+    old = (made_with.get("frames") or {}).get("source")
+    if not isinstance(old, dict):
+        return
+    src = Path(old.get("path", ""))
+    try:
+        same = src.is_file() and src.stat().st_size == old.get("bytes")
+    except OSError:
+        same = False
+    if same and file_identity(src) == inputs["frames"]["source"]:
+        made_with["frames"] = {**made_with["frames"], "source": inputs["frames"]["source"]}
+
+
+def file_identity(path: Path, cache: dict | None = None) -> str:
     """Size plus a hash of the start, middle and end: the same video copied or moved keeps it,
-    a different one does not. Reading three samples keeps this instant on a 4K video."""
-    size = path.stat().st_size
+    a different one does not. Reading three samples keeps this instant on a 4K video.
+
+    `cache` maps a path to [size, mtime, identity]: an unchanged stat means no reading at all,
+    which matters for a folder of a few hundred photos on every rerun."""
+    st = path.stat()
+    key, stamp = str(path.resolve()), [st.st_size, st.st_mtime_ns]
+    if cache is not None and cache.get(key, [None, None])[:2] == stamp:
+        return cache[key][2]
+    size = st.st_size
     digest = hashlib.sha256(str(size).encode())
     with open(path, "rb") as fh:
         for at in sorted({0, max(0, size // 2 - SAMPLE_BYTES // 2), max(0, size - SAMPLE_BYTES)}):
             fh.seek(at)
             digest.update(fh.read(SAMPLE_BYTES))
-    return digest.hexdigest()[:20]
+    found = digest.hexdigest()[:20]
+    if cache is not None:
+        cache[key] = stamp + [found]
+    return found
 
 
-def source_identity(src: Path) -> str:
+def source_identity(src: Path, cache: dict | None = None) -> str:
     """What a frames stage was made from, by content: a video, or the images in a folder (other
     files there, such as .AAE sidecars, are not read and do not count)."""
     if not src.is_dir():
-        return file_identity(src)
+        return file_identity(src, cache)
     digest = hashlib.sha256()
     for image in fr.list_images(src):
-        digest.update(f"{image.name}:{file_identity(image)};".encode())
+        digest.update(f"{image.name}:{file_identity(image, cache)};".encode())
     return digest.hexdigest()[:20]
 
 
-def stage_inputs(args, src: Path) -> dict:
+def stage_inputs(args, src: Path, cache: dict | None = None) -> dict:
     """Per stage, the options its output depends on. Stages not listed depend only on the
     stages before them."""
-    return {"frames": {"source": source_identity(src), "max_size": args.max_size,
+    return {"frames": {"source": source_identity(src, cache), "max_size": args.max_size,
                        "count": None if src.is_dir() else args.frames},
             "undistort": {"dense_size": args.dense_size},
             "masks": {"mask": args.mask},
@@ -159,6 +196,8 @@ class ScanLog:
         self.path, self.echo = path, echo
         self.start = time.time()
         self.timings: dict = {}
+        self.reused: list = []      # stages already done when this run began
+        self.failed: str | None = None
 
     def write(self, text: str) -> None:
         with open(self.path, "a", encoding="utf-8") as fh:
@@ -169,7 +208,7 @@ class ScanLog:
         self.write(f"[{time.time() - self.start:8.1f} s] {text}")
 
     def header(self, args, colmap) -> None:
-        settings = {k: v for k, v in vars(args).items()}
+        settings = dict(vars(args))
         self.write(f"\n===== fleshforge-scan {time.strftime('%Y-%m-%d %H:%M:%S')}")
         self.write(f"settings: {json.dumps(settings)}")
         self.write(f"colmap: {colmap.version() or '?'} [{colmap.where}]")
@@ -180,6 +219,7 @@ class ScanLog:
         try:
             yield
         except BaseException as exc:
+            self.failed = name
             self.write(f"stage {name}: FAILED after {time.time() - began:.1f} s: "
                        f"{type(exc).__name__}: {exc}".splitlines()[0])
             raise
@@ -187,9 +227,11 @@ class ScanLog:
         self.write(f"stage {name}: {self.timings[name]:.1f} s")
 
     def summary(self) -> None:
-        reused = [s for s in STAGES if s not in self.timings]
-        if reused:
-            self.write(f"reused from an earlier run: {', '.join(reused)}")
+        if self.reused:
+            self.write(f"reused from an earlier run: {', '.join(self.reused)}")
+        skipped = [s for s in STAGES if s not in self.timings and s not in self.reused and s != self.failed]
+        if skipped:
+            self.write(f"not run: {', '.join(skipped)}")
         self.write(f"total: {time.time() - self.start:.1f} s")
 
 
@@ -222,12 +264,17 @@ def scan(args, report_line=print) -> dict:
 
 def _scan(args, src: Path, run: Run, colmap, fallback, log: ScanLog) -> dict:
     say = log.line
-    if run.state.get("done") and "inputs" not in run.state:
+    legacy = bool(run.state.get("done")) and "inputs" not in run.state
+    if legacy:
         say("note: this run folder predates input tracking; its finished stages are kept as if "
             "made with these options (use --from to redo them)")
-    changed = run.match_inputs(stage_inputs(args, src))
+    changed = run.match_inputs(stage_inputs(args, src, run.state.setdefault("file_ids", {})))
     if changed:
         say(f"inputs changed since the last run: redoing from {changed}")
+    gone = run.missing_output(args.mask == "person")
+    if gone:
+        say(f"the files of the {gone} stage are missing: redoing from {gone}")
+        run.redo_from(gone)
     if args.from_stage:
         if STAGES.index(args.from_stage) <= STAGES.index("stereo"):
             # asked to redo stereo: give the local COLMAP another chance (it may have been
@@ -236,6 +283,7 @@ def _scan(args, src: Path, run: Run, colmap, fallback, log: ScanLog) -> dict:
         run.redo_from(args.from_stage)
     say(f"colmap: {colmap.where}")
     root = run.dir
+    log.reused = [s for s in STAGES if run.done(s)]
 
     if not run.done("frames"):
         with log.stage("frames"):
@@ -243,7 +291,6 @@ def _scan(args, src: Path, run: Run, colmap, fallback, log: ScanLog) -> dict:
                 shutil.rmtree(run.frames)
             facts = (fr.frames_from_folder(str(src), run.frames, args.max_size, say) if src.is_dir()
                      else fr.frames_from_video(str(src), run.frames, args.frames, args.max_size, say))
-            run.redo_from("sfm")
             run.finish("frames", frames_info=facts)
     n_frames = len(fr.list_images(run.frames))
 
@@ -251,11 +298,15 @@ def _scan(args, src: Path, run: Run, colmap, fallback, log: ScanLog) -> dict:
         with log.stage("sfm"):
             say(f"sfm: solving camera poses for {n_frames} frames")
             cm.sparse(colmap, root, run.frames, run.colmap, n_frames, not args.no_gpu, run.log, say)
-            run.redo_from("undistort")
             run.finish("sfm")
     chosen = run.state.get("model")
     if chosen and (run.dir / chosen["folder"]).is_dir():
         model, n_models = cm.read_model(colmap, root, run.dir / chosen["folder"], run.log), chosen["models"]
+    elif legacy and run.done("undistort"):
+        # made before the choice was saved: find the one it used, without merging again
+        model, n_models = cm.earlier_choice(colmap, root, run.colmap / "sparse", run.log)
+        run.state["model"] = {"folder": model.folder.relative_to(run.dir).as_posix(), "models": n_models}
+        run.save()
     else:    # picking (and maybe merging) is done once, so every rerun uses the same poses
         if run.done("undistort"):
             # the saved model is gone, and a new pick or merge can move the poses a little:
@@ -274,7 +325,6 @@ def _scan(args, src: Path, run: Run, colmap, fallback, log: ScanLog) -> dict:
     if not run.done("undistort"):
         with log.stage("undistort"):
             cm.undistort(colmap, root, run.frames, model.folder, run.dense, args.dense_size, run.log, say)
-            run.redo_from("masks")
             run.finish("undistort")
 
     use_masks = args.mask == "person"
@@ -285,7 +335,6 @@ def _scan(args, src: Path, run: Run, colmap, fallback, log: ScanLog) -> dict:
                 from fleshforge.core import masks as mk
                 say("masks: finding the person in each frame")
                 facts = mk.person_masks(run.dense / "images", run.masks, report=say)
-            run.redo_from("fuse")
             run.finish("masks", masks=facts)
 
     if not run.done("stereo"):
@@ -305,7 +354,6 @@ def _scan(args, src: Path, run: Run, colmap, fallback, log: ScanLog) -> dict:
                 run.save()
                 say(f"  dense stereo failed in the local COLMAP; retrying in {fallback.where}")
                 cm.stereo(fallback, root, run.dense, args.dense, run.log, say)
-            run.redo_from("fuse")
             run.finish("stereo")
 
     if not run.done("fuse"):

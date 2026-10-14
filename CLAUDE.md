@@ -45,14 +45,24 @@ The `.venv` is Python 3.12 (open3d has no 3.13+ wheels).
   options or source changed is redone with everything after it. A new option that changes a
   stage's output must be added there, or reruns will reuse stale files. The source is known by
   content (`file_identity`: size plus three 1 MiB samples), never by path or mtime, so a moved
-  video does not cost an hour of stereo. A folder with no `inputs` (older than this) adopts the
-  current ones. `Run.redo_from` saves at once, so a crash mid-redo leaves no stale "done".
+  video does not cost an hour of stereo. `state["file_ids"]` caches identities by path, size
+  and mtime, so unchanged photos are not read again. `Run.redo_from` saves at once, so a crash
+  mid-redo leaves no stale "done".
+- **Older run folders are migrated, not redone.** No `inputs` (before 9f1826a): the current
+  inputs are adopted, and the model is found on disk by `cm.earlier_choice` (largest model, or
+  `colmap/merged/adjusted` if a merge happened) without merging again. A dict `source` (from
+  9f1826a) is accepted if that path still holds a file of that size and today's identity.
 - **A missing saved model means redo from undistort**: a new pick or merge can move the poses.
+  A done stage whose files are gone (`Run.missing_output`) is redone from that stage.
 - **`stereo_crashed` in state.json** sends stereo straight to the fallback; an explicit
   `--from` at or before stereo clears it, so the local COLMAP gets another chance.
 - **`Colmap.help` treats a non-zero exit as "could not start"**: COLMAP's help exits 0, and
-  otherwise Docker's own error (no NVIDIA container toolkit) would be read as help text.
-- **`scan.log`** is written by `ScanLog`: settings, timestamped progress, per-stage seconds.
+  otherwise Docker's own error (no NVIDIA container toolkit) would be read as help text. The
+  failure is cached like the text (one launch), the message is the last line saying "error",
+  and `cm.stereo` calls `help` before `has_cuda` so that error is what the user sees.
+- **`scan.log`** is written by `ScanLog`: settings, timestamped progress, per-stage seconds,
+  then which stages were reused (done when the run began) and which were not run (after a
+  failure).
 - **Over 200 frames, matching uses a pair list** (`cm.match_pairs`, via `matches_importer`):
   neighbours in time plus every 8th frame. `sequential_matcher` alone never closes the loop,
   and a video may go round the head several times.

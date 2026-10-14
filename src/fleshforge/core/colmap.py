@@ -57,21 +57,28 @@ class Colmap:
         return cmd + ["--entrypoint", self.exe, self.image, command] + [_in_mount(a, root) for a in args]
 
     def help(self, command: str) -> str:
+        """`colmap <command> -h`. A COLMAP that does not start raises ColmapError, and the
+        failure is kept like the text, so a broken Docker setup is launched once, not per call."""
         if command not in self._help:
-            try:
-                done = subprocess.run(self.command(command, ["-h"]), capture_output=True, text=True,
-                                      env=self.env)
-            except OSError as exc:
-                raise ColmapError(f"could not start {self.where}: {exc}") from exc
-            if done.returncode != 0:
-                # COLMAP's own help exits 0. Anything else is the launcher failing, most often
-                # Docker refusing --gpus all without the NVIDIA container toolkit; its message
-                # must not be read as COLMAP's help text (or as "built without CUDA")
-                said = (done.stderr.strip() or done.stdout.strip()).splitlines()
-                raise ColmapError(f"could not start {self.where} (exit {done.returncode}): "
-                                  f"{said[0] if said else 'no message'}")
-            self._help[command] = done.stdout + done.stderr
-        return self._help[command]
+            self._help[command] = self._probe(command)
+        found = self._help[command]
+        if isinstance(found, ColmapError):
+            raise found
+        return found
+
+    def _probe(self, command: str):
+        try:
+            done = subprocess.run(self.command(command, ["-h"]), capture_output=True, text=True,
+                                  env=self.env)
+        except OSError as exc:
+            return ColmapError(f"could not start {self.where}: {exc}")
+        if done.returncode != 0:
+            # COLMAP's own help exits 0. Anything else is the launcher failing, most often
+            # Docker refusing --gpus all without the NVIDIA container toolkit; its message
+            # must not be read as COLMAP's help text (or as "built without CUDA")
+            return ColmapError(f"could not start {self.where} (exit {done.returncode}): "
+                               f"{_the_error(done.stderr + done.stdout)}")
+        return done.stdout + done.stderr
 
     def option(self, command: str, *names: str) -> str:
         """The first of `names` this COLMAP's `command` accepts."""
@@ -114,6 +121,16 @@ class Colmap:
             raise ColmapError(f"colmap {command} failed (exit {code:#x}) in {self.where}. "
                               f"End of {log}:\n{tail}")
         report(f"  colmap {command}: {time.time() - start:.0f} s")
+
+
+def _the_error(text: str) -> str:
+    """The line of a failed launch that says why: Docker often prints a warning (a platform
+    mismatch, say) before the error itself."""
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return "no message"
+    errors = [line for line in lines if "error" in line.lower()]
+    return errors[-1] if errors else lines[-1]
 
 
 def _in_mount(arg, root) -> str:
@@ -265,6 +282,7 @@ def undistort(colmap: Colmap, root: Path, frames_dir: Path, model_dir: Path, den
 
 
 def stereo(colmap: Colmap, root: Path, dense_dir: Path, quality: str, log: Path, report=print) -> None:
+    colmap.help("help")      # a COLMAP that does not start says so here, not "without CUDA"
     if not colmap.has_cuda():
         raise ColmapError(f"{colmap.where} was built without CUDA, and dense stereo needs it")
     q = DENSE[quality]
@@ -417,3 +435,20 @@ def best_model(colmap: Colmap, root: Path, sparse_dir: Path, log: Path) -> tuple
         return models[0], 1
     model, left_out = merge_models(colmap, root, models, sparse_dir.parent / "merged", log)
     return model, 1 + left_out
+
+
+def earlier_choice(colmap: Colmap, root: Path, sparse_dir: Path, log: Path) -> tuple[SparseModel, int]:
+    """The model a run folder from before the choice was saved used, found on disk without
+    merging or adjusting anything again (which could move the poses its depth maps came from).
+    Returns it and how many separate models it stands for, as `best_model` does."""
+    folders = sorted(p for p in sparse_dir.iterdir() if p.is_dir() and not p.name.endswith("_txt"))
+    if not folders:
+        raise ColmapError(f"no sparse model in {sparse_dir}; redo the scan with --from sfm")
+    models = [read_model(colmap, root, f, log) for f in folders]
+    best = max(models, key=lambda m: len(m.poses))
+    adjusted = sparse_dir.parent / "merged" / "adjusted"
+    if len(models) > 1 and (adjusted / "images.bin").exists():
+        best = read_model(colmap, root, adjusted, log)
+    covered = {p.name for p in best.poses}
+    left_out = sum(1 for m in models if m is not best and not {p.name for p in m.poses} <= covered)
+    return best, 1 + left_out

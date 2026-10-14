@@ -302,6 +302,46 @@ def test_a_launcher_error_is_not_read_as_help_text(tmp_path):
     assert fake.version() == "" and not fake.has_cuda()
 
 
+def test_a_failed_start_is_launched_once_and_names_the_error(tmp_path):
+    # Docker prints a warning first and the error after it; the error is what the user needs
+    script = tmp_path / "launcher.py"
+    script.write_text("import sys\n"
+                      "open(sys.argv[1], 'a').write('x')\n"
+                      "print('WARNING: the requested image platform does not match', file=sys.stderr)\n"
+                      "print('docker: Error response from daemon: could not select device driver', file=sys.stderr)\n"
+                      "sys.exit(125)\n")
+    count = tmp_path / "count"
+    fake = cm.Colmap(sys.executable)
+    fake.command = lambda command, args, root=None: [sys.executable, str(script), str(count)]
+    with pytest.raises(cm.ColmapError, match="Error response from daemon"):
+        fake.help("help")
+    assert fake.version() == "" and not fake.has_cuda()
+    with pytest.raises(cm.ColmapError, match="could not select device driver"):
+        cm.stereo(fake, tmp_path, tmp_path / "dense", "fast", tmp_path / "log")   # not "without CUDA"
+    assert count.read_text() == "x"                                   # one launch for all of that
+
+
+def test_earlier_choice_finds_the_merged_model_without_merging(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    def folder(path, names):
+        path.mkdir(parents=True)
+        (path / "names").write_text(" ".join(names))
+        (path / "images.bin").write_bytes(b"")
+    monkeypatch.setattr(cm, "read_model", lambda colmap, root, f, log: cm.SparseModel(
+        f, [SimpleNamespace(name=n) for n in (f / "names").read_text().split()], 0, 0.0))
+    sparse = tmp_path / "colmap" / "sparse"
+    folder(sparse / "0", "abcd")
+    folder(sparse / "1", "cdef")
+    folder(sparse / "2", "xy")
+    fake = FakeMerger()
+    model, n = cm.earlier_choice(fake, tmp_path, sparse, tmp_path / "log")
+    assert model.folder == sparse / "0" and n == 3 and fake.commands == []      # nothing merged yet
+    folder(tmp_path / "colmap" / "merged" / "adjusted", "abcdef")
+    model, n = cm.earlier_choice(fake, tmp_path, sparse, tmp_path / "log")
+    assert model.folder.name == "adjusted" and n == 2 and fake.commands == []    # "xy" left out
+
+
 def test_option_picks_the_name_this_version_has():
     c = cm.Colmap("colmap")
     c._help["feature_extractor"] = "  --SiftExtraction.use_gpu arg (=1)\n"
@@ -362,7 +402,6 @@ def test_merge_models_joins_what_shares_frames(tmp_path, monkeypatch):
     assert sorted(best.poses) == list("abcdef") and left_out == 1
     assert fake.commands.count("bundle_adjuster") == 1
 
-    # "gh" shares frames only with "fg", which joins only once "cdef" has: a second round
     # "ghi" shares frames only with "eg", which is tried after it: "ghi" joins in a second round
     chain = [model("3", "abcde"), model("4", "ghi"), model("5", "eg")]
     fake = FakeMerger()
@@ -377,6 +416,9 @@ def test_merge_models_joins_what_shares_frames(tmp_path, monkeypatch):
 
 def test_stereo_clears_stale_depth_maps(tmp_path):
     class Recorder(cm.Colmap):
+        def help(self, command):
+            return "COLMAP 4.2.1 (with CUDA)"
+
         def has_cuda(self):
             return True
 
