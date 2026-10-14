@@ -9,7 +9,10 @@ stage and everything after it.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import hashlib
 import json
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -21,6 +24,7 @@ from fleshforge.core import frames as fr
 from fleshforge.core import glbwrite, mesh, orient, report
 
 STAGES = ["frames", "sfm", "undistort", "masks", "stereo", "fuse", "mesh"]
+SAMPLE_BYTES = 1 << 20      # a file is told apart by its size and three 1 MiB samples
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -57,7 +61,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 class Run:
     """The run folder: where each stage's files live, which stages are done, and what each was
-    made from. A stage whose inputs differ from last time is redone, with everything after it."""
+    made from. A stage whose inputs differ from last time is redone, with everything after it.
+    Every change to the state is written straight away, so a crash part-way through a redone
+    stage cannot leave state.json claiming files that are already deleted."""
 
     def __init__(self, folder: Path):
         self.dir = folder
@@ -88,25 +94,50 @@ class Run:
         self.state["done"] = [s for s in self.state.get("done", []) if s not in later]
         if "sfm" in later:
             self.state.pop("model", None)
+        if self.state_file.parent.is_dir():
+            self.save()
 
-    def match_inputs(self, inputs: dict) -> None:
-        """Redo from the first stage whose `inputs` differ from the ones it was made with."""
-        made_with = self.state.get("inputs", {})
-        for stage in STAGES:
-            if stage in inputs and made_with.get(stage) != inputs[stage]:
-                self.redo_from(stage)
-                break
+    def match_inputs(self, inputs: dict) -> str | None:
+        """Redo from the first stage whose `inputs` differ from the ones it was made with.
+        Returns that stage, or None.
+
+        A folder made before inputs were recorded has done stages and no inputs: those are
+        taken as made with the current ones, since redoing them could cost an hour of stereo."""
+        made_with = self.state.get("inputs")
+        changed = None
+        if made_with is not None:
+            for stage in STAGES:
+                if stage in inputs and made_with.get(stage) != inputs[stage]:
+                    changed = stage
+                    self.redo_from(stage)
+                    break
         self.state["inputs"] = inputs
+        if self.state_file.parent.is_dir():
+            self.save()
+        return changed
 
 
-def source_identity(src: Path) -> dict:
-    """What a frames stage was made from: the same path with other contents counts as new."""
-    src = src.resolve()
-    if src.is_dir():
-        files = [p for p in src.iterdir() if p.is_file()]
-        return {"path": str(src), "files": len(files), "bytes": sum(p.stat().st_size for p in files)}
-    st = src.stat()
-    return {"path": str(src), "bytes": st.st_size, "modified": int(st.st_mtime)}
+def file_identity(path: Path) -> str:
+    """Size plus a hash of the start, middle and end: the same video copied or moved keeps it,
+    a different one does not. Reading three samples keeps this instant on a 4K video."""
+    size = path.stat().st_size
+    digest = hashlib.sha256(str(size).encode())
+    with open(path, "rb") as fh:
+        for at in sorted({0, max(0, size // 2 - SAMPLE_BYTES // 2), max(0, size - SAMPLE_BYTES)}):
+            fh.seek(at)
+            digest.update(fh.read(SAMPLE_BYTES))
+    return digest.hexdigest()[:20]
+
+
+def source_identity(src: Path) -> str:
+    """What a frames stage was made from, by content: a video, or the images in a folder (other
+    files there, such as .AAE sidecars, are not read and do not count)."""
+    if not src.is_dir():
+        return file_identity(src)
+    digest = hashlib.sha256()
+    for image in fr.list_images(src):
+        digest.update(f"{image.name}:{file_identity(image)};".encode())
+    return digest.hexdigest()[:20]
 
 
 def stage_inputs(args, src: Path) -> dict:
@@ -117,6 +148,49 @@ def stage_inputs(args, src: Path) -> dict:
             "undistort": {"dense_size": args.dense_size},
             "masks": {"mask": args.mask},
             "stereo": {"dense": args.dense}}
+
+
+class ScanLog:
+    """scan.log in the run folder: per run, the settings used, every progress line with the time
+    since the start, and how long each stage took. Appended to, so earlier runs stay readable,
+    and written line by line, so a run that dies still shows how far it got."""
+
+    def __init__(self, path: Path, echo=print):
+        self.path, self.echo = path, echo
+        self.start = time.time()
+        self.timings: dict = {}
+
+    def write(self, text: str) -> None:
+        with open(self.path, "a", encoding="utf-8") as fh:
+            fh.write(text + "\n")
+
+    def line(self, text: str) -> None:
+        self.echo(text)
+        self.write(f"[{time.time() - self.start:8.1f} s] {text}")
+
+    def header(self, args, colmap) -> None:
+        settings = {k: v for k, v in vars(args).items()}
+        self.write(f"\n===== fleshforge-scan {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        self.write(f"settings: {json.dumps(settings)}")
+        self.write(f"colmap: {colmap.version() or '?'} [{colmap.where}]")
+
+    @contextlib.contextmanager
+    def stage(self, name: str):
+        began = time.time()
+        try:
+            yield
+        except BaseException as exc:
+            self.write(f"stage {name}: FAILED after {time.time() - began:.1f} s: "
+                       f"{type(exc).__name__}: {exc}".splitlines()[0])
+            raise
+        self.timings[name] = round(time.time() - began, 1)
+        self.write(f"stage {name}: {self.timings[name]:.1f} s")
+
+    def summary(self) -> None:
+        reused = [s for s in STAGES if s not in self.timings]
+        if reused:
+            self.write(f"reused from an earlier run: {', '.join(reused)}")
+        self.write(f"total: {time.time() - self.start:.1f} s")
 
 
 def fail(errors: list, force: bool) -> None:
@@ -133,111 +207,143 @@ def scan(args, report_line=print) -> dict:
         raise SystemExit(f"{src}: no such file or folder")
     run = Run(Path(args.output))
     run.dir.mkdir(parents=True, exist_ok=True)
-    run.match_inputs(stage_inputs(args, src))
-    if args.from_stage:
-        run.redo_from(args.from_stage)
+    log = ScanLog(run.dir / "scan.log", report_line)
     colmap, fallback = cm.choose(args.colmap)
-    report_line(f"colmap: {colmap.where}")
+    log.header(args, colmap)
+    try:
+        stats = _scan(args, src, run, colmap, fallback, log)
+    except BaseException as exc:
+        log.write(f"stopped: {type(exc).__name__}: {exc}".splitlines()[0])
+        log.summary()
+        raise
+    log.summary()
+    return stats
+
+
+def _scan(args, src: Path, run: Run, colmap, fallback, log: ScanLog) -> dict:
+    say = log.line
+    if run.state.get("done") and "inputs" not in run.state:
+        say("note: this run folder predates input tracking; its finished stages are kept as if "
+            "made with these options (use --from to redo them)")
+    changed = run.match_inputs(stage_inputs(args, src))
+    if changed:
+        say(f"inputs changed since the last run: redoing from {changed}")
+    if args.from_stage:
+        if STAGES.index(args.from_stage) <= STAGES.index("stereo"):
+            # asked to redo stereo: give the local COLMAP another chance (it may have been
+            # updated, or the earlier failure may have been a full disk or a busy GPU)
+            run.state.pop("stereo_crashed", None)
+        run.redo_from(args.from_stage)
+    say(f"colmap: {colmap.where}")
     root = run.dir
-    started = time.time()
 
     if not run.done("frames"):
-        if run.frames.exists():
-            import shutil
-            shutil.rmtree(run.frames)
-        facts = (fr.frames_from_folder(str(src), run.frames, args.max_size, report_line) if src.is_dir()
-                 else fr.frames_from_video(str(src), run.frames, args.frames, args.max_size, report_line))
-        run.redo_from("sfm")
-        run.finish("frames", frames_info=facts)
+        with log.stage("frames"):
+            if run.frames.exists():
+                shutil.rmtree(run.frames)
+            facts = (fr.frames_from_folder(str(src), run.frames, args.max_size, say) if src.is_dir()
+                     else fr.frames_from_video(str(src), run.frames, args.frames, args.max_size, say))
+            run.redo_from("sfm")
+            run.finish("frames", frames_info=facts)
     n_frames = len(fr.list_images(run.frames))
 
     if not run.done("sfm"):
-        report_line(f"sfm: solving camera poses for {n_frames} frames")
-        cm.sparse(colmap, root, run.frames, run.colmap, n_frames, not args.no_gpu, run.log, report_line)
-        run.redo_from("undistort")
-        run.finish("sfm")
+        with log.stage("sfm"):
+            say(f"sfm: solving camera poses for {n_frames} frames")
+            cm.sparse(colmap, root, run.frames, run.colmap, n_frames, not args.no_gpu, run.log, say)
+            run.redo_from("undistort")
+            run.finish("sfm")
     chosen = run.state.get("model")
     if chosen and (run.dir / chosen["folder"]).is_dir():
         model, n_models = cm.read_model(colmap, root, run.dir / chosen["folder"], run.log), chosen["models"]
     else:    # picking (and maybe merging) is done once, so every rerun uses the same poses
+        if run.done("undistort"):
+            # the saved model is gone, and a new pick or merge can move the poses a little:
+            # everything made from the old ones has to be made again
+            say("the saved camera solution is missing; picking it again and redoing from undistort")
+            run.redo_from("undistort")
         model, n_models = cm.best_model(colmap, root, run.colmap / "sparse", run.log)
         run.state["model"] = {"folder": model.folder.relative_to(run.dir).as_posix(), "models": n_models}
         run.save()
-    report_line(f"sfm: {len(model.poses)}/{n_frames} frames placed, {model.n_points:,} points, "
-                f"reprojection error {model.reproj_error:.2f} px")
+    say(f"sfm: {len(model.poses)}/{n_frames} frames placed, {model.n_points:,} points, "
+        f"reprojection error {model.reproj_error:.2f} px")
     errors, _ = report.check_sparse(n_frames, len(model.poses), n_models)
     if errors:
         fail(errors, args.force)
 
     if not run.done("undistort"):
-        cm.undistort(colmap, root, run.frames, model.folder, run.dense, args.dense_size, run.log,
-                     report_line)
-        run.redo_from("masks")
-        run.finish("undistort")
+        with log.stage("undistort"):
+            cm.undistort(colmap, root, run.frames, model.folder, run.dense, args.dense_size, run.log, say)
+            run.redo_from("masks")
+            run.finish("undistort")
 
     use_masks = args.mask == "person"
     if not run.done("masks"):
-        facts = None
-        if use_masks:
-            from fleshforge.core import masks as mk
-            report_line("masks: finding the person in each frame")
-            facts = mk.person_masks(run.dense / "images", run.masks, report=report_line)
-        run.redo_from("fuse")
-        run.finish("masks", masks=facts)
+        with log.stage("masks"):
+            facts = None
+            if use_masks:
+                from fleshforge.core import masks as mk
+                say("masks: finding the person in each frame")
+                facts = mk.person_masks(run.dense / "images", run.masks, report=say)
+            run.redo_from("fuse")
+            run.finish("masks", masks=facts)
 
     if not run.done("stereo"):
-        report_line(f"stereo: depth maps, {args.dense} (the slow part)")
-        crashed = run.state.setdefault("stereo_crashed", [])
-        stereo_colmap = colmap
-        if fallback is not None and colmap.where in crashed:
-            report_line(f"  the local COLMAP's dense stereo crashed here before; using {fallback.where}")
-            stereo_colmap = fallback
-        try:
-            cm.stereo(stereo_colmap, root, run.dense, args.dense, run.log, report_line)
-        except cm.ColmapError:
-            if fallback is None or stereo_colmap is fallback:
-                raise
-            crashed.append(colmap.where)
-            run.save()
-            report_line(f"  dense stereo failed in the local COLMAP; retrying in {fallback.where}")
-            cm.stereo(fallback, root, run.dense, args.dense, run.log, report_line)
-        run.redo_from("fuse")
-        run.finish("stereo")
+        with log.stage("stereo"):
+            say(f"stereo: depth maps, {args.dense} (the slow part)")
+            crashed = run.state.setdefault("stereo_crashed", [])
+            stereo_colmap = colmap
+            if fallback is not None and colmap.where in crashed:
+                say(f"  the local COLMAP's dense stereo crashed here before; using {fallback.where}")
+                stereo_colmap = fallback
+            try:
+                cm.stereo(stereo_colmap, root, run.dense, args.dense, run.log, say)
+            except cm.ColmapError:
+                if fallback is None or stereo_colmap is fallback:
+                    raise
+                crashed.append(colmap.where)
+                run.save()
+                say(f"  dense stereo failed in the local COLMAP; retrying in {fallback.where}")
+                cm.stereo(fallback, root, run.dense, args.dense, run.log, say)
+            run.redo_from("fuse")
+            run.finish("stereo")
 
     if not run.done("fuse"):
-        cm.fuse(colmap, root, run.dense, run.fused, run.masks if use_masks else None, args.dense,
-                run.log, report_line)
-        run.finish("fuse")
+        with log.stage("fuse"):
+            cm.fuse(colmap, root, run.dense, run.fused, run.masks if use_masks else None, args.dense,
+                    run.log, say)
+            run.finish("fuse")
 
     # mesh, orientation and export are quick, so they are always redone
-    centres = np.array([p.centre for p in model.poses])
-    up = orient.unit(np.mean([p.up for p in model.poses], axis=0))
-    centre = orient.look_at_point(centres, [p.forward for p in model.poses])
-    distance = float(np.linalg.norm(centres - centre, axis=1).mean())
-    report_line("mesh: building the surface")
-    m = mesh.build(run.fused, centre, args.crop * distance if args.crop > 0 else None,
-                   args.poisson_depth, args.triangles, report_line, args.smooth, distance)
+    with log.stage("mesh"):
+        centres = np.array([p.centre for p in model.poses])
+        up = orient.unit(np.mean([p.up for p in model.poses], axis=0))
+        centre = orient.look_at_point(centres, [p.forward for p in model.poses])
+        distance = float(np.linalg.norm(centres - centre, axis=1).mean())
+        say("mesh: building the surface")
+        m = mesh.build(run.fused, centre, args.crop * distance if args.crop > 0 else None,
+                       args.poisson_depth, args.triangles, say, args.smooth, distance)
 
-    faces = orient.detect_faces([run.frames / p.name for p in model.poses], report_line)
-    front = orient.front_direction(model.poses, centre, up, faces)
-    face_found = front is not None
-    if not face_found:
-        front = model.poses[0].centre - centre      # a guess: the video usually starts in front
-    R = orient.basis(up, front)
-    vertices = orient.to_gltf_frame(m.vertices, centre, R)
-    normals = m.normals @ R.T
-    vertices -= (vertices.min(axis=0) + vertices.max(axis=0)) / 2.0
-    vertices *= orient.NOMINAL_SIZE_M / float((vertices.max(axis=0) - vertices.min(axis=0)).max())
-    tris = m.faces
-    if report.signed_volume(vertices, tris) < 0:      # inside out: flip to outward-facing
-        tris, normals = tris[:, ::-1], -normals
+        faces = orient.detect_faces([run.frames / p.name for p in model.poses], say)
+        front = orient.front_direction(model.poses, centre, up, faces)
+        face_found = front is not None
+        if not face_found:
+            front = model.poses[0].centre - centre      # a guess: the video usually starts in front
+        R = orient.basis(up, front)
+        vertices = orient.to_gltf_frame(m.vertices, centre, R)
+        normals = m.normals @ R.T
+        vertices -= (vertices.min(axis=0) + vertices.max(axis=0)) / 2.0
+        vertices *= orient.NOMINAL_SIZE_M / float((vertices.max(axis=0) - vertices.min(axis=0)).max())
+        tris = m.faces
+        if report.signed_volume(vertices, tris) < 0:      # inside out: flip to outward-facing
+            tris, normals = tris[:, ::-1], -normals
 
-    glb = run.dir / "head.glb"
-    glbwrite.write_glb(glb, vertices, tris, m.colors, normals)
-    report.save_preview(run.dir / "preview.png", *mesh.sample_surface(vertices, tris, m.colors))
+        glb = run.dir / "head.glb"
+        glbwrite.write_glb(glb, vertices, tris, m.colors, normals)
+        report.save_preview(run.dir / "preview.png", *mesh.sample_surface(vertices, tris, m.colors))
 
     stats = {
-        "input": str(src), "colmap": colmap.version(), "dense": args.dense, "smooth": args.smooth,
+        "input": str(src), "colmap": colmap.version(), "settings": vars(args),
         "frames": n_frames,
         "registered": len(model.poses), "models": n_models, "sparse_points": model.n_points,
         "reproj_error": round(model.reproj_error, 3),
@@ -245,18 +351,19 @@ def scan(args, report_line=print) -> dict:
         "face_found": face_found, "faces_detected": len(faces),
         "frames_info": run.state.get("frames_info"), "masks": run.state.get("masks"),
         "mesh": m.stats, "size_m": orient.NOMINAL_SIZE_M,
-        "seconds": round(time.time() - started),
+        "seconds": round(time.time() - log.start),
+        "stage_seconds": dict(log.timings),        # stages run this time; the rest were reused
     }
     errors, warnings = report.check_scan(stats)
     stats["errors"], stats["warnings"] = errors, warnings
     (run.dir / "report.json").write_text(json.dumps(stats, indent=1))
     for w in warnings:
-        report_line(f"warning: {w}")
+        say(f"warning: {w}")
     if errors:
         fail(errors, args.force)
-    report_line(f"wrote {glb} ({m.stats['triangles']:,} triangles); look at {run.dir / 'preview.png'}")
-    report_line(f"print it:  stackforge-paint {glb} --scale-to 50 --filaments <four ids> "
-                "--template <your slicer project.3mf> --preview paint.png -o head.3mf")
+    say(f"wrote {glb} ({m.stats['triangles']:,} triangles); look at {run.dir / 'preview.png'}")
+    say(f"print it:  stackforge-paint {glb} --scale-to 50 --filaments <four ids> "
+        "--template <your slicer project.3mf> --preview paint.png -o head.3mf")
     return stats
 
 

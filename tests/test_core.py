@@ -287,6 +287,19 @@ def test_a_colmap_that_does_not_start_is_an_error_not_a_crash(tmp_path):
     assert broken.version() == "" and not broken.has_cuda()
     with pytest.raises(cm.ColmapError, match="could not start"):
         broken.option("feature_extractor", "--FeatureExtraction.use_gpu")
+    with pytest.raises(cm.ColmapError, match="could not start"):
+        broken.run("model_converter", [], tmp_path, tmp_path / "log", report=lambda *_: None)
+
+
+def test_a_launcher_error_is_not_read_as_help_text(tmp_path):
+    # stands in for `docker run --gpus all ...` failing: an exit code and a message, no COLMAP
+    script = tmp_path / "launcher.py"
+    script.write_text("import sys; print('docker: could not select device driver'); sys.exit(125)")
+    fake = cm.Colmap(sys.executable)
+    fake.command = lambda command, args, root=None: [sys.executable, str(script)]
+    with pytest.raises(cm.ColmapError, match="exit 125.*could not select device driver"):
+        fake.help("help")
+    assert fake.version() == "" and not fake.has_cuda()
 
 
 def test_option_picks_the_name_this_version_has():
@@ -350,9 +363,12 @@ def test_merge_models_joins_what_shares_frames(tmp_path, monkeypatch):
     assert fake.commands.count("bundle_adjuster") == 1
 
     # "gh" shares frames only with "fg", which joins only once "cdef" has: a second round
-    chain = [model("3", "abcde"), model("4", "gh"), model("5", "efg")]
-    best, left_out = cm.merge_models(FakeMerger(), tmp_path, chain, tmp_path / "m3", tmp_path / "log")
-    assert sorted(best.poses) == list("abcdefgh") and left_out == 0
+    # "ghi" shares frames only with "eg", which is tried after it: "ghi" joins in a second round
+    chain = [model("3", "abcde"), model("4", "ghi"), model("5", "eg")]
+    fake = FakeMerger()
+    best, left_out = cm.merge_models(fake, tmp_path, chain, tmp_path / "m3", tmp_path / "log")
+    assert sorted(best.poses) == list("abcdeghi") and left_out == 0
+    assert fake.commands.count("model_merger") == 3                # ghi, eg, then ghi again
 
     fake = FakeMerger()                                     # nothing joins: the largest, untouched
     best, left_out = cm.merge_models(fake, tmp_path, [models[0], models[2]], tmp_path / "m2", tmp_path / "log")

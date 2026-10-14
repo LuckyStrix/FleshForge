@@ -70,8 +70,14 @@ A folder of photos works in place of a video: `fleshforge-scan photos/ -o runs/a
 Each stage keeps its output in the run folder, so a rerun continues where it stopped.
 `state.json` records what each stage was made from (the input file, `--frames`, `--max-size`,
 `--dense-size`, `--mask`, `--dense`), and a stage whose inputs changed is redone with the ones
-after it, so a new video in an old folder never reuses the last person's frames.
-`--from STAGE` redoes that stage and the ones after it regardless.
+after it, so a new video in an old folder never reuses the last person's frames. The input is
+recognised by its contents, so a moved or re-copied video counts as the same one; for a folder
+of photos only the images count, not sidecar files. `--from STAGE` redoes that stage and the
+ones after it regardless. A folder made before inputs were recorded keeps its finished stages.
+
+`scan.log` in the run folder keeps, for every run, the settings used, each progress line with
+the time since the start, how long each stage took, and which stages were reused. A run that
+fails still logs how far it got. `report.json` also holds the settings and `stage_seconds`.
 
 | stage | what happens |
 |---|---|

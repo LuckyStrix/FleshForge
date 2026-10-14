@@ -63,6 +63,13 @@ class Colmap:
                                       env=self.env)
             except OSError as exc:
                 raise ColmapError(f"could not start {self.where}: {exc}") from exc
+            if done.returncode != 0:
+                # COLMAP's own help exits 0. Anything else is the launcher failing, most often
+                # Docker refusing --gpus all without the NVIDIA container toolkit; its message
+                # must not be read as COLMAP's help text (or as "built without CUDA")
+                said = (done.stderr.strip() or done.stdout.strip()).splitlines()
+                raise ColmapError(f"could not start {self.where} (exit {done.returncode}): "
+                                  f"{said[0] if said else 'no message'}")
             self._help[command] = done.stdout + done.stderr
         return self._help[command]
 
@@ -98,7 +105,10 @@ class Colmap:
         with open(log, "a", encoding="utf-8", errors="replace") as fh:
             fh.write(f"\n===== {' '.join(cmd)}\n")
             fh.flush()
-            code = subprocess.run(cmd, stdout=fh, stderr=subprocess.STDOUT, env=self.env).returncode
+            try:
+                code = subprocess.run(cmd, stdout=fh, stderr=subprocess.STDOUT, env=self.env).returncode
+            except OSError as exc:
+                raise ColmapError(f"could not start {self.where}: {exc}") from exc
         if code != 0:
             tail = "\n".join(Path(log).read_text(encoding="utf-8", errors="replace").splitlines()[-12:])
             raise ColmapError(f"colmap {command} failed (exit {code:#x}) in {self.where}. "

@@ -41,10 +41,14 @@ def checks() -> list[tuple[str, bool, bool, str]]:
     for label, colmap in (("colmap (local)", native), ("colmap (Docker)", docker)):
         if colmap is None:
             continue
+        try:
+            colmap.help("help")
+        except cm.ColmapError as exc:
+            # the Docker copy is only a fallback when there is a local one
+            add(label, False, str(exc), required=colmap is native or native is None)
+            continue
         version, cuda = colmap.version(), colmap.has_cuda()
-        # the Docker copy is only a fallback when there is a local one
-        add(label, bool(version) and cuda,
-            f"{version or 'did not start'}  [{colmap.where}]" + ("" if cuda else "  NO CUDA"),
+        add(label, cuda, f"{version}  [{colmap.where}]" + ("" if cuda else "  NO CUDA"),
             required=colmap is native or native is None)
     if native is None and docker is None:
         add("colmap", False, f"none found; run scripts/setup_windows.ps1, or `docker pull {cm.DEFAULT_IMAGE}`")

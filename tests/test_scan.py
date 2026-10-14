@@ -75,6 +75,76 @@ def test_new_inputs_redo_the_stages_that_depend_on_them(tmp_path):
     assert not run.done("frames")
 
 
+def test_a_copied_or_moved_video_is_the_same_video(tmp_path):
+    video = tmp_path / "orbit.mp4"
+    video.write_bytes(bytes(range(256)) * 20_000)                 # 5 MB: three separate samples
+    parse = scan.build_parser().parse_args
+    run = finished_run(tmp_path, parse([str(video), "-o", str(tmp_path / "run")]))
+    moved = tmp_path / "elsewhere" / "copy of orbit.mp4"
+    moved.parent.mkdir()
+    shutil.copy(video, moved)                                      # new path, new mtime
+    assert run.match_inputs(scan.stage_inputs(parse([str(moved), "-o", str(run.dir)]), moved)) is None
+    assert run.done("stereo")
+
+    changed = bytearray(video.read_bytes())
+    changed[len(changed) // 2] ^= 1                               # one byte in the middle
+    moved.write_bytes(changed)
+    assert run.match_inputs(scan.stage_inputs(parse([str(moved), "-o", str(run.dir)]), moved)) == "frames"
+
+
+def test_a_photo_folder_is_its_images_only(tmp_path):
+    photos = tmp_path / "photos"
+    photos.mkdir()
+    for name in ("a.jpg", "b.jpg"):
+        (photos / name).write_bytes(name.encode() * 100)
+    before = scan.source_identity(photos)
+    (photos / "a.AAE").write_text("sidecar")
+    (photos / "desktop.ini").write_text("[.ShellClassInfo]")
+    assert scan.source_identity(photos) == before
+    (photos / "b.jpg").write_bytes(b"B.jpg" * 100)                # edited, same size
+    assert scan.source_identity(photos) != before
+
+
+def test_an_old_run_folder_keeps_its_stages(tmp_path):
+    video = tmp_path / "orbit.mp4"
+    video.write_bytes(b"orbit")
+    run = scan.Run(tmp_path / "run")
+    run.dir.mkdir()
+    for stage in scan.STAGES[:-1]:
+        run.finish(stage)                                          # no "inputs": made before tracking
+    args = scan.build_parser().parse_args([str(video), "-o", str(run.dir), "--dense", "fine"])
+    assert run.match_inputs(scan.stage_inputs(args, video)) is None
+    assert scan.Run(run.dir).done("stereo") and scan.Run(run.dir).state["inputs"]["stereo"] == {"dense": "fine"}
+
+
+def test_a_redo_is_on_disk_before_its_files_go(tmp_path):
+    # the crash case: inputs changed, the frames are deleted, and the run dies before any stage
+    # finishes. The next run must not think the old frames are still there
+    video = tmp_path / "orbit.mp4"
+    video.write_bytes(b"alex")
+    parse = scan.build_parser().parse_args
+    finished_run(tmp_path, parse([str(video), "-o", str(tmp_path / "run")]))
+    video.write_bytes(b"sam")
+    scan.Run(tmp_path / "run").match_inputs(scan.stage_inputs(parse([str(video), "-o", "x"]), video))
+    assert not scan.Run(tmp_path / "run").done("frames")          # read back from state.json
+
+
+def test_scan_log_records_settings_and_stage_times(tmp_path):
+    shown = []
+    log = scan.ScanLog(tmp_path / "scan.log", shown.append)
+    args = scan.build_parser().parse_args(["in.mp4", "-o", "out", "--dense", "fine"])
+    log.header(args, cm.Colmap(str(tmp_path / "no-colmap.exe")))
+    with log.stage("frames"):
+        log.line("frames: kept 3")
+    with pytest.raises(RuntimeError), log.stage("sfm"):
+        raise RuntimeError("mapper fell over")
+    log.summary()
+    text = (tmp_path / "scan.log").read_text(encoding="utf-8")
+    assert '"dense": "fine"' in text and "frames: kept 3" in text and shown == ["frames: kept 3"]
+    assert "stage frames:" in text and "stage sfm: FAILED" in text and "mapper fell over" in text
+    assert "reused from an earlier run: sfm, undistort" in text and "frames" in log.timings
+
+
 def test_missing_input_is_reported(tmp_path):
     args = scan.build_parser().parse_args([str(tmp_path / "nope.mp4"), "-o", str(tmp_path / "run")])
     with pytest.raises(SystemExit) as err:
@@ -135,6 +205,10 @@ def test_full_scan_of_a_synthetic_ball(tmp_path):
                if line.startswith("===== ")]
     assert started and all(" model_converter " in line for line in started)
     assert again["registered"] == stats["registered"]
+    assert set(stats["stage_seconds"]) == set(scan.STAGES) and set(again["stage_seconds"]) == {"mesh"}
+    text = (tmp_path / "run" / "scan.log").read_text(encoding="utf-8")
+    assert text.count("===== fleshforge-scan") == 2 and "stage stereo:" in text
+    assert "reused from an earlier run: frames, sfm, undistort, masks, stereo, fuse" in text
 
 
 @pytest.mark.skipif(not colmap_available(), reason="no COLMAP (or FLESHFORGE_SKIP_COLMAP=1)")
