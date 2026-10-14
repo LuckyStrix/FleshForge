@@ -260,6 +260,35 @@ def test_quat_to_rot_quarter_turn_about_z():
     assert np.allclose(cm.quat_to_rot(s, 0, 0, s) @ [1, 0, 0], [0, 1, 0])
 
 
+def test_match_pairs_closes_the_loop_on_a_long_video():
+    names = [f"{i:06d}.jpg" for i in range(300)]
+    pairs = cm.match_pairs(names, window=10, stride=8)
+    assert len(set(pairs)) == len(pairs) and all(a < b for a, b in pairs)
+    linked = {(a, b) for a, b in pairs}
+    assert ("000100.jpg", "000105.jpg") in linked                  # neighbours in time
+    # a later lap: every frame meets the strided frames, so the 3rd lap links back to the 1st
+    assert any(a == "000016.jpg" and int(b[:6]) > 200 for a, b in pairs)
+    assert len(pairs) < 300 * 299 / 2 / 3                         # a third of every pair
+
+
+def test_has_cuda_reads_the_line_after_the_version_too():
+    def with_help(text):
+        c = cm.Colmap("colmap")
+        c._help["help"] = text
+        return c
+    assert with_help("COLMAP 4.2.1 (Commit bd1fcf6 with CUDA)\nUsage:").has_cuda()
+    assert with_help("COLMAP 3.9.1\n(Commit 1234 on 2024-01-01 with CUDA)\nUsage:").has_cuda()
+    assert not with_help("COLMAP 3.9.1\n(Commit 1234 without CUDA)\n").has_cuda()
+    assert not with_help("COLMAP 4.2.1\nUsage:\n\n  stereo_fusion --input_type ... with CUDA").has_cuda()
+
+
+def test_a_colmap_that_does_not_start_is_an_error_not_a_crash(tmp_path):
+    broken = cm.Colmap(str(tmp_path / "not-a-program.exe"))
+    assert broken.version() == "" and not broken.has_cuda()
+    with pytest.raises(cm.ColmapError, match="could not start"):
+        broken.option("feature_extractor", "--FeatureExtraction.use_gpu")
+
+
 def test_option_picks_the_name_this_version_has():
     c = cm.Colmap("colmap")
     c._help["feature_extractor"] = "  --SiftExtraction.use_gpu arg (=1)\n"
@@ -318,7 +347,12 @@ def test_merge_models_joins_what_shares_frames(tmp_path, monkeypatch):
     models = [model("0", "abcd"), model("1", "cdef"), model("2", "xy")]
     best, left_out = cm.merge_models(fake, tmp_path, models, tmp_path / "merged", tmp_path / "log")
     assert sorted(best.poses) == list("abcdef") and left_out == 1
-    assert fake.commands == ["model_merger", "model_merger", "bundle_adjuster"]
+    assert fake.commands.count("bundle_adjuster") == 1
+
+    # "gh" shares frames only with "fg", which joins only once "cdef" has: a second round
+    chain = [model("3", "abcde"), model("4", "gh"), model("5", "efg")]
+    best, left_out = cm.merge_models(FakeMerger(), tmp_path, chain, tmp_path / "m3", tmp_path / "log")
+    assert sorted(best.poses) == list("abcdefgh") and left_out == 0
 
     fake = FakeMerger()                                     # nothing joins: the largest, untouched
     best, left_out = cm.merge_models(fake, tmp_path, [models[0], models[2]], tmp_path / "m2", tmp_path / "log")

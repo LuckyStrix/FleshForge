@@ -56,7 +56,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 class Run:
-    """The run folder: where each stage's files live, and which stages are done."""
+    """The run folder: where each stage's files live, which stages are done, and what each was
+    made from. A stage whose inputs differ from last time is redone, with everything after it."""
 
     def __init__(self, folder: Path):
         self.dir = folder
@@ -72,16 +73,50 @@ class Run:
     def done(self, stage: str) -> bool:
         return stage in self.state.get("done", [])
 
+    def save(self) -> None:
+        self.state_file.write_text(json.dumps(self.state, indent=1))
+
     def finish(self, stage: str, **facts) -> None:
         self.state.setdefault("done", [])
         if stage not in self.state["done"]:
             self.state["done"].append(stage)
         self.state.update(facts)
-        self.state_file.write_text(json.dumps(self.state, indent=1))
+        self.save()
 
     def redo_from(self, stage: str) -> None:
         later = STAGES[STAGES.index(stage):]
         self.state["done"] = [s for s in self.state.get("done", []) if s not in later]
+        if "sfm" in later:
+            self.state.pop("model", None)
+
+    def match_inputs(self, inputs: dict) -> None:
+        """Redo from the first stage whose `inputs` differ from the ones it was made with."""
+        made_with = self.state.get("inputs", {})
+        for stage in STAGES:
+            if stage in inputs and made_with.get(stage) != inputs[stage]:
+                self.redo_from(stage)
+                break
+        self.state["inputs"] = inputs
+
+
+def source_identity(src: Path) -> dict:
+    """What a frames stage was made from: the same path with other contents counts as new."""
+    src = src.resolve()
+    if src.is_dir():
+        files = [p for p in src.iterdir() if p.is_file()]
+        return {"path": str(src), "files": len(files), "bytes": sum(p.stat().st_size for p in files)}
+    st = src.stat()
+    return {"path": str(src), "bytes": st.st_size, "modified": int(st.st_mtime)}
+
+
+def stage_inputs(args, src: Path) -> dict:
+    """Per stage, the options its output depends on. Stages not listed depend only on the
+    stages before them."""
+    return {"frames": {"source": source_identity(src), "max_size": args.max_size,
+                       "count": None if src.is_dir() else args.frames},
+            "undistort": {"dense_size": args.dense_size},
+            "masks": {"mask": args.mask},
+            "stereo": {"dense": args.dense}}
 
 
 def fail(errors: list, force: bool) -> None:
@@ -98,6 +133,7 @@ def scan(args, report_line=print) -> dict:
         raise SystemExit(f"{src}: no such file or folder")
     run = Run(Path(args.output))
     run.dir.mkdir(parents=True, exist_ok=True)
+    run.match_inputs(stage_inputs(args, src))
     if args.from_stage:
         run.redo_from(args.from_stage)
     colmap, fallback = cm.choose(args.colmap)
@@ -120,7 +156,13 @@ def scan(args, report_line=print) -> dict:
         cm.sparse(colmap, root, run.frames, run.colmap, n_frames, not args.no_gpu, run.log, report_line)
         run.redo_from("undistort")
         run.finish("sfm")
-    model, n_models = cm.best_model(colmap, root, run.colmap / "sparse", run.log)
+    chosen = run.state.get("model")
+    if chosen and (run.dir / chosen["folder"]).is_dir():
+        model, n_models = cm.read_model(colmap, root, run.dir / chosen["folder"], run.log), chosen["models"]
+    else:    # picking (and maybe merging) is done once, so every rerun uses the same poses
+        model, n_models = cm.best_model(colmap, root, run.colmap / "sparse", run.log)
+        run.state["model"] = {"folder": model.folder.relative_to(run.dir).as_posix(), "models": n_models}
+        run.save()
     report_line(f"sfm: {len(model.poses)}/{n_frames} frames placed, {model.n_points:,} points, "
                 f"reprojection error {model.reproj_error:.2f} px")
     errors, _ = report.check_sparse(n_frames, len(model.poses), n_models)
@@ -134,26 +176,33 @@ def scan(args, report_line=print) -> dict:
         run.finish("undistort")
 
     use_masks = args.mask == "person"
-    if not run.done("masks") or run.state.get("mask_mode") != args.mask:
+    if not run.done("masks"):
         facts = None
         if use_masks:
             from fleshforge.core import masks as mk
             report_line("masks: finding the person in each frame")
             facts = mk.person_masks(run.dense / "images", run.masks, report=report_line)
         run.redo_from("fuse")
-        run.finish("masks", mask_mode=args.mask, masks=facts)
+        run.finish("masks", masks=facts)
 
-    if not run.done("stereo") or run.state.get("dense") != args.dense:
+    if not run.done("stereo"):
         report_line(f"stereo: depth maps, {args.dense} (the slow part)")
+        crashed = run.state.setdefault("stereo_crashed", [])
+        stereo_colmap = colmap
+        if fallback is not None and colmap.where in crashed:
+            report_line(f"  the local COLMAP's dense stereo crashed here before; using {fallback.where}")
+            stereo_colmap = fallback
         try:
-            cm.stereo(colmap, root, run.dense, args.dense, run.log, report_line)
+            cm.stereo(stereo_colmap, root, run.dense, args.dense, run.log, report_line)
         except cm.ColmapError:
-            if fallback is None:
+            if fallback is None or stereo_colmap is fallback:
                 raise
+            crashed.append(colmap.where)
+            run.save()
             report_line(f"  dense stereo failed in the local COLMAP; retrying in {fallback.where}")
             cm.stereo(fallback, root, run.dense, args.dense, run.log, report_line)
         run.redo_from("fuse")
-        run.finish("stereo", dense=args.dense)
+        run.finish("stereo")
 
     if not run.done("fuse"):
         cm.fuse(colmap, root, run.dense, run.fused, run.masks if use_masks else None, args.dense,

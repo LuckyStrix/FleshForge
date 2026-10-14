@@ -6,6 +6,7 @@ is found, and with FLESHFORGE_SKIP_COLMAP=1.
 import os
 import shutil
 import subprocess
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -27,11 +28,51 @@ def test_run_state_remembers_and_redoes(tmp_path):
     run = scan.Run(tmp_path)
     for stage in ("frames", "sfm", "undistort"):
         run.finish(stage)
-    run.finish("masks", mask_mode="off")
+    run.finish("masks", masks={"images": 3})
     again = scan.Run(tmp_path)
-    assert again.done("sfm") and again.state["mask_mode"] == "off"
+    assert again.done("sfm") and again.state["masks"] == {"images": 3}
     again.redo_from("undistort")
     assert again.done("sfm") and not again.done("undistort") and not again.done("masks")
+
+
+def finished_run(tmp_path, args):
+    run = scan.Run(tmp_path / "run")
+    run.dir.mkdir(exist_ok=True)
+    run.match_inputs(scan.stage_inputs(args, Path(args.input)))
+    for stage in scan.STAGES[:-1]:
+        run.finish(stage)
+    run.state["model"] = {"folder": "colmap/sparse/0", "models": 1}
+    run.save()
+    return scan.Run(run.dir)
+
+
+def test_new_inputs_redo_the_stages_that_depend_on_them(tmp_path):
+    video = tmp_path / "alex.mp4"
+    video.write_bytes(b"alex")
+    parse = scan.build_parser().parse_args
+    base = [str(video), "-o", str(tmp_path / "run")]
+
+    run = finished_run(tmp_path, parse(base))
+    run.match_inputs(scan.stage_inputs(parse(base), video))          # same again: nothing to redo
+    assert run.done("stereo") and "model" in run.state
+
+    run.match_inputs(scan.stage_inputs(parse(base + ["--dense-size", "1600"]), video))
+    assert run.done("sfm") and not run.done("undistort") and "model" in run.state
+
+    run = finished_run(tmp_path, parse(base))
+    run.match_inputs(scan.stage_inputs(parse(base + ["--dense", "fine"]), video))
+    assert run.done("masks") and not run.done("stereo") and not run.done("fuse")
+
+    run = finished_run(tmp_path, parse(base))
+    video.write_bytes(b"sam, a different person")                  # same name, new video
+    run.match_inputs(scan.stage_inputs(parse(base), video))
+    assert not run.done("frames") and not run.done("sfm") and "model" not in run.state
+
+    sam = tmp_path / "sam.mp4"
+    sam.write_bytes(b"sam")
+    run = finished_run(tmp_path, parse(base))
+    run.match_inputs(scan.stage_inputs(parse([str(sam), "-o", str(tmp_path / "run")]), sam))
+    assert not run.done("frames")
 
 
 def test_missing_input_is_reported(tmp_path):
@@ -84,3 +125,27 @@ def test_full_scan_of_a_synthetic_ball(tmp_path):
     # the ball is reddish (see synth.ball_colour); linear red well above blue
     assert arrays["COLOR_0"][:, 0].mean() > 1.5 * arrays["COLOR_0"][:, 2].mean()
     assert (tmp_path / "run" / "preview.png").exists()
+
+    # a rerun with the same options only redoes the mesh: the saved poses are read back
+    # (model_converter), and no COLMAP step that computes anything runs again
+    log = tmp_path / "run" / "colmap.log"
+    before = len(log.read_text(encoding="utf-8", errors="replace"))
+    again = scan.scan(args, report_line=lambda *_: None)
+    started = [line for line in log.read_text(encoding="utf-8", errors="replace")[before:].splitlines()
+               if line.startswith("===== ")]
+    assert started and all(" model_converter " in line for line in started)
+    assert again["registered"] == stats["registered"]
+
+
+@pytest.mark.skipif(not colmap_available(), reason="no COLMAP (or FLESHFORGE_SKIP_COLMAP=1)")
+def test_sparse_from_a_pair_list(tmp_path, monkeypatch):
+    # the path taken above EXHAUSTIVE_MAX_FRAMES, run on a small set by lowering the limit
+    synth.write_orbit(tmp_path / "run" / "frames", count=32)
+    monkeypatch.setattr(cm, "EXHAUSTIVE_MAX_FRAMES", 10)
+    colmap, _ = cm.choose("auto")
+    root = tmp_path / "run"
+    sparse = cm.sparse(colmap, root, root / "frames", root / "colmap", 32, True, root / "colmap.log",
+                       report=lambda *_: None)
+    assert (root / "colmap" / "pairs.txt").exists()
+    model, _ = cm.best_model(colmap, root, sparse, root / "colmap.log")
+    assert len(model.poses) >= 30

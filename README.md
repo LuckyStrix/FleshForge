@@ -68,12 +68,15 @@ A folder of photos works in place of a video: `fleshforge-scan photos/ -o runs/a
 ## What the stages do
 
 Each stage keeps its output in the run folder, so a rerun continues where it stopped.
-`--from STAGE` redoes that stage and the ones after it.
+`state.json` records what each stage was made from (the input file, `--frames`, `--max-size`,
+`--dense-size`, `--mask`, `--dense`), and a stage whose inputs changed is redone with the ones
+after it, so a new video in an old folder never reuses the last person's frames.
+`--from STAGE` redoes that stage and the ones after it regardless.
 
 | stage | what happens |
 |---|---|
 | `frames` | ffmpeg extracts three times the frames needed, and the sharpest in each time window is kept (120 by default) |
-| `sfm` | COLMAP finds features, matches every pair, and solves the camera positions. If it splits the orbit into several reconstructions, the ones that share frames are merged |
+| `sfm` | COLMAP finds features, matches them, and solves the camera positions. Up to 200 frames every pair is matched; above that, each frame is matched with its neighbours in time and with every 8th frame, which still links a video that goes round several times. If COLMAP splits the orbit into several reconstructions, the ones that share frames are merged. The chosen model is remembered, so later stages always use the same poses |
 | `undistort` | frames are corrected for lens distortion and shrunk to `--dense-size` |
 | `masks` | the person is found in each frame (rembg, `u2net_human_seg`), so the room stays out of the cloud |
 | `stereo` | COLMAP computes a depth map per frame on the GPU (the slow part) |
@@ -99,7 +102,8 @@ carries on regardless.
 The official Windows build of COLMAP 4.2.1 crashes in dense stereo on an RTX 5060 Ti
 (`0xC0000409`, no message), while the same version in a Linux container runs on the same card.
 So with `--colmap auto` (the default) the local COLMAP does everything and, if its dense stereo
-fails, that one step is retried in Docker:
+fails, that one step is retried in Docker, and the run folder remembers it so later reruns go
+straight to Docker:
 
 ```sh
 docker pull colmap/colmap:latest      # or set FLESHFORGE_COLMAP_IMAGE to another image

@@ -172,11 +172,11 @@ def build(cloud_ply: Path, centre, radius, depth: int = 9, triangles: int = 300_
                         "otherwise retake the video with more light and a slower orbit")
 
     cloud_points, cloud_colors = np.asarray(pcd.points), np.asarray(pcd.colors)
+    if not pcd.has_normals():
+        pcd.estimate_normals(o3d.geometry.KDTreeSearchParamKNN(32))
+        pcd.orient_normals_consistent_tangent_plane(24)
     if smooth > 0:
         unit = distance or float(np.linalg.norm(pcd.get_max_bound() - pcd.get_min_bound())) / 2
-        if not pcd.has_normals():
-            pcd.estimate_normals(o3d.geometry.KDTreeSearchParamKNN(32))
-            pcd.orient_normals_consistent_tangent_plane(24)
         pcd = pcd.voxel_down_sample(SMOOTH_VOXEL * unit * smooth)
         points, normals = smooth_points(np.asarray(pcd.points))
         # the fitted planes have no inside or outside; take that from the cloud's own normals
@@ -184,9 +184,6 @@ def build(cloud_ply: Path, centre, radius, depth: int = 9, triangles: int = 300_
         pcd.points = o3d.utility.Vector3dVector(points)
         pcd.normals = o3d.utility.Vector3dVector(normals)
         report(f"  smoothed: {len(points):,} evenly spaced points")
-    if not pcd.has_normals():
-        pcd.estimate_normals(o3d.geometry.KDTreeSearchParamKNN(32))
-        pcd.orient_normals_consistent_tangent_plane(24)
     mesh, _ = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd, depth=depth, linear_fit=True)
 
     # keep the biggest piece: Poisson leaves small shells round stray points

@@ -13,6 +13,8 @@ from pathlib import Path
 
 import numpy as np
 
+from fleshforge.core.frames import list_images
+
 MODEL = "u2net_human_seg"
 ERODE_PX_PER_1000 = 4       # pull the edge in: edge pixels are part background
 
@@ -31,7 +33,7 @@ def person_masks(images_dir: Path, mask_dir: Path, model: str = MODEL, report=pr
             "(Norton does), that download fails: fetch the .onnx by hand from "
             "https://github.com/danielgatis/rembg/releases/tag/v0.0.0, or run with --mask off.")
     mask_dir.mkdir(parents=True, exist_ok=True)
-    images = sorted(p for p in images_dir.iterdir() if p.suffix.lower() in (".jpg", ".jpeg", ".png"))
+    images = list_images(images_dir)
     coverage = []
     for n, path in enumerate(images, 1):
         im = Image.open(path).convert("RGB")

@@ -17,8 +17,12 @@ from pathlib import Path
 
 import numpy as np
 
+from fleshforge.core.frames import list_images
+
 REPO_ROOT = Path(__file__).resolve().parents[3]
-EXHAUSTIVE_MAX_FRAMES = 200     # above this, match neighbours in time instead of every pair
+EXHAUSTIVE_MAX_FRAMES = 200     # above this, match a chosen list of pairs instead of every pair
+PAIR_WINDOW = 10                # ...each frame with the frames this close to it in order
+PAIR_STRIDE = 8                 # ...and with every this-many-th frame of the whole set
 DEFAULT_IMAGE = "colmap/colmap:latest"
 DOCKER_MOUNT = "/work"
 
@@ -54,7 +58,11 @@ class Colmap:
 
     def help(self, command: str) -> str:
         if command not in self._help:
-            done = subprocess.run(self.command(command, ["-h"]), capture_output=True, text=True, env=self.env)
+            try:
+                done = subprocess.run(self.command(command, ["-h"]), capture_output=True, text=True,
+                                      env=self.env)
+            except OSError as exc:
+                raise ColmapError(f"could not start {self.where}: {exc}") from exc
             self._help[command] = done.stdout + done.stderr
         return self._help[command]
 
@@ -68,12 +76,20 @@ class Colmap:
                           "version is not supported (checked against 4.2.1)")
 
     def version(self) -> str:
-        lines = self.help("help").strip().splitlines()
+        """The first line of `colmap help`, or "" when this COLMAP does not start."""
+        try:
+            lines = self.help("help").strip().splitlines()
+        except ColmapError:
+            return ""
         return lines[0] if lines else ""
 
     def has_cuda(self) -> bool:
-        first = self.version()
-        return "with CUDA" in first and "without CUDA" not in first
+        # 4.x says "with CUDA" on the version line, 3.x on the line after it
+        try:
+            head = " ".join(self.help("help").splitlines()[:3])
+        except ColmapError:
+            return False
+        return "with CUDA" in head and "without CUDA" not in head
 
     def run(self, command: str, args: list, root: Path, log: Path, report=print) -> None:
         """`root` is the run folder: every path in `args` lies inside it."""
@@ -196,16 +212,37 @@ def sparse(colmap: Colmap, root: Path, frames_dir: Path, work: Path, n_frames: i
         "--ImageReader.single_camera", "1", "--ImageReader.camera_model", "SIMPLE_RADIAL",
         fx_gpu, _flag(gpu)], root, log, report)
 
-    matcher = "exhaustive_matcher" if n_frames <= EXHAUSTIVE_MAX_FRAMES else "sequential_matcher"
+    matcher = "exhaustive_matcher" if n_frames <= EXHAUSTIVE_MAX_FRAMES else "matches_importer"
     fm_gpu = colmap.option(matcher, "--FeatureMatching.use_gpu", "--SiftMatching.use_gpu")
     args = ["--database_path", db, fm_gpu, _flag(gpu)]
-    if matcher == "sequential_matcher":
-        args += ["--SequentialMatching.overlap", "20"]
+    if matcher == "matches_importer":
+        pairs = work / "pairs.txt"
+        names = [p.name for p in list_images(frames_dir)]
+        pairs.write_text("".join(f"{a} {b}\n" for a, b in match_pairs(names)), encoding="utf-8")
+        args += ["--match_list_path", pairs, "--match_type", "pairs"]
     colmap.run(matcher, args, root, log, report)
 
     colmap.run("mapper", ["--database_path", db, "--image_path", frames_dir, "--output_path", out],
                root, log, report)
     return out
+
+
+def match_pairs(names: list, window: int = PAIR_WINDOW, stride: int = PAIR_STRIDE) -> list:
+    """Image pairs to match when there are too many frames to match every pair.
+
+    Each frame is paired with its neighbours in order (the camera moved little between them)
+    and with every `stride`-th frame of the whole set. The second part is what closes the
+    loop: a video that goes round the head two or three times sees each side once per lap, and
+    those laps are far apart in time, which matching only neighbours in time would never pair."""
+    n = len(names)
+    keep = set()
+    for i in range(n):
+        for j in range(i + 1, min(n, i + window + 1)):
+            keep.add((i, j))
+        for j in range(0, n, stride):
+            if j != i:
+                keep.add((min(i, j), max(i, j)))
+    return [(names[i], names[j]) for i, j in sorted(keep)]
 
 
 def undistort(colmap: Colmap, root: Path, frames_dir: Path, model_dir: Path, dense_dir: Path,
@@ -317,28 +354,36 @@ def read_model(colmap: Colmap, root: Path, model_dir: Path, log: Path) -> Sparse
 
 
 def merge_models(colmap: Colmap, root: Path, models: list, work: Path, log: Path) -> tuple[SparseModel, int]:
-    """Join the smaller models onto the largest where they share frames, then re-optimise.
+    """Join the other models onto the largest where they share frames, then re-optimise.
 
     Returns (model, how many models were left out). The mapper starts a new model when it cannot
     carry on from the last frame (the back of a head against a plain wall is typical); the same
-    frames often sit in both, and that overlap is what `model_merger` aligns them by."""
+    frames often sit in both, and that overlap is what `model_merger` aligns them by. A model
+    that shares frames only with another small one joins once that one has, so the leftovers
+    are tried again until a whole round adds nothing."""
     models = sorted(models, key=lambda m: len(m.poses), reverse=True)
-    best, left_out = models[0], 0
-    for k, other in enumerate(models[1:]):
-        out = work / f"merge{k}"
-        if out.exists():
-            shutil.rmtree(out)
-        out.mkdir(parents=True)
-        try:
-            colmap.run("model_merger", ["--input_path1", best.folder, "--input_path2", other.folder,
-                                        "--output_path", out], root, log, report=lambda *_: None)
-            joined = read_model(colmap, root, out, log) if (out / "images.bin").exists() else None
-        except ColmapError:
-            joined = None
-        if joined and len(joined.poses) > len(best.poses):
-            best = joined
-        else:
-            left_out += 1
+    best, waiting, tries = models[0], models[1:], 0
+    while waiting:
+        left = []
+        for other in waiting:
+            out = work / f"merge{tries}"
+            tries += 1
+            if out.exists():
+                shutil.rmtree(out)
+            out.mkdir(parents=True)
+            try:
+                colmap.run("model_merger", ["--input_path1", best.folder, "--input_path2", other.folder,
+                                            "--output_path", out], root, log, report=lambda *_: None)
+                joined = read_model(colmap, root, out, log) if (out / "images.bin").exists() else None
+            except ColmapError:
+                joined = None
+            if joined and len(joined.poses) > len(best.poses):
+                best = joined
+            else:
+                left.append(other)
+        if len(left) == len(waiting):
+            break
+        waiting = left
     if best is not models[0]:
         out = work / "adjusted"
         if out.exists():
@@ -347,7 +392,7 @@ def merge_models(colmap: Colmap, root: Path, models: list, work: Path, log: Path
         colmap.run("bundle_adjuster", ["--input_path", best.folder, "--output_path", out], root, log,
                    report=lambda *_: None)
         best = read_model(colmap, root, out, log)
-    return best, left_out
+    return best, len(waiting)
 
 
 def best_model(colmap: Colmap, root: Path, sparse_dir: Path, log: Path) -> tuple[SparseModel, int]:

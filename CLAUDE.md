@@ -18,7 +18,8 @@ The `.venv` is Python 3.12 (open3d has no 3.13+ wheels).
 - **Official Windows COLMAP 4.2.1: `patch_match_stereo` dies with 0xC0000409 on the RTX 5060 Ti**,
   no message, with or without geometric consistency. Same version in Docker works
   (`colmap/colmap:latest`, and the Digital-Twins `fip3d-pipeline` image). `cm.choose("auto")`
-  returns the local COLMAP plus a Docker fallback, and `scan` retries only the stereo step.
+  returns the local COLMAP plus a Docker fallback, and `scan` retries only the stereo step,
+  recording the crash in `state.json` (`stereo_crashed`) so reruns skip the local attempt.
 - **COLMAP skips an image whose depth map exists.** `cm.stereo` deletes old `*.bin` first, or a
   rerun with other settings silently reuses the old maps.
 - **Path arguments to `Colmap.run` must be `Path` objects inside the run folder.** Under Docker
@@ -36,8 +37,16 @@ The `.venv` is Python 3.12 (open3d has no 3.13+ wheels).
   way, which Open3D counts as fine), cap, repeat. `cap_holes` gives each rim loop its own centre;
   one fan for two openings that touch at a vertex puts four triangles on one edge.
 - **The mapper splits a head orbit** at the back-of-head frames when the wall behind is plain.
-  `cm.best_model` merges models that share frames (`model_merger`, then `bundle_adjuster`); on
-  the first real scan that took 122 placed frames to 150 of 160.
+  `cm.best_model` merges models that share frames (`model_merger`, then `bundle_adjuster`),
+  retrying the leftovers until a round adds nothing; on the first real scan that took 122
+  placed frames to 150 of 160. The result is saved as `state["model"]` and only re-read
+  afterwards: re-merging on every run is slow and can shift the poses under undistort.
+- **Stage caching is by inputs** (`scan.stage_inputs`, `Run.match_inputs`): a stage whose
+  options or source file (path, size, mtime) changed is redone with everything after it. A new
+  option that changes a stage's output must be added there, or reruns will reuse stale files.
+- **Over 200 frames, matching uses a pair list** (`cm.match_pairs`, via `matches_importer`):
+  neighbours in time plus every 8th frame. `sequential_matcher` alone never closes the loop,
+  and a video may go round the head several times.
 - **Smoothing is sized from the camera distance**, the only yardstick in a scan with no scale:
   `SMOOTH_VOXEL` x distance x `--smooth` is the point spacing, and each point moves onto the
   plane through its 48 neighbours. Colours still come from the unsmoothed cloud.
